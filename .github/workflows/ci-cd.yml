@@ -1,0 +1,71 @@
+name: CI/CD
+
+on:
+  pull_request:
+    branches: [main, master, homolog]
+  push:
+    branches: [main, master, homolog]
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: maven
+
+      - name: Run tests
+        run: mvn test
+
+      - name: Package deployment artifact
+        run: mvn package -DskipTests
+
+      - name: Upload deployment artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpf-login-lambda
+          path: target/cpf-login-lambda.jar
+
+  # Deploys to an AWS Lambda function that already exists (provisioned separately via
+  # Terraform). Needs these repo secrets before it can run for real:
+  #   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
+  # and these repo variables naming the target function per environment:
+  #   LAMBDA_FUNCTION_NAME_PROD, LAMBDA_FUNCTION_NAME_HOMOLOG
+  deploy:
+    needs: build-test
+    if: github.event_name == 'push' && contains(fromJSON('["refs/heads/main", "refs/heads/master", "refs/heads/homolog"]'), github.ref)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download deployment artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: cpf-login-lambda
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Resolve target function name
+        id: fn
+        run: |
+          if [ "${{ github.ref }}" = "refs/heads/homolog" ]; then
+            echo "name=${{ vars.LAMBDA_FUNCTION_NAME_HOMOLOG }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${{ vars.LAMBDA_FUNCTION_NAME_PROD }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy to AWS Lambda
+        run: |
+          aws lambda update-function-code \
+            --function-name "${{ steps.fn.outputs.name }}" \
+            --zip-file fileb://cpf-login-lambda.jar
