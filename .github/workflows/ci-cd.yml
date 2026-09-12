@@ -1,71 +1,86 @@
-name: CI/CD
+name: Lambda CI/CD
 
 on:
   pull_request:
-    branches: [main, master, homolog]
+    branches: master
   push:
-    branches: [main, master, homolog]
+    branches: master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
 
 jobs:
   build-test:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
-
       - name: Setup Java 21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 21
           cache: maven
-
       - name: Run tests
         run: mvn test
-
       - name: Package deployment artifact
         run: mvn package -DskipTests
-
       - name: Upload deployment artifact
         uses: actions/upload-artifact@v4
         with:
           name: cpf-login-lambda
           path: target/cpf-login-lambda.jar
 
-  # Deploys to an AWS Lambda function that already exists (provisioned separately via
-  # Terraform). Needs these repo secrets before it can run for real:
-  #   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
-  # and these repo variables naming the target function per environment:
-  #   LAMBDA_FUNCTION_NAME_PROD, LAMBDA_FUNCTION_NAME_HOMOLOG
   deploy:
     needs: build-test
-    if: github.event_name == 'push' && contains(fromJSON('["refs/heads/main", "refs/heads/master", "refs/heads/homolog"]'), github.ref)
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
-
     steps:
       - name: Download deployment artifact
         uses: actions/download-artifact@v4
         with:
           name: cpf-login-lambda
-
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
-
-      - name: Resolve target function name
-        id: fn
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Upload immutable Lambda deployment artifact
         run: |
-          if [ "${{ github.ref }}" = "refs/heads/homolog" ]; then
-            echo "name=${{ vars.LAMBDA_FUNCTION_NAME_HOMOLOG }}" >> "$GITHUB_OUTPUT"
+          aws s3 cp cpf-login-lambda.jar \
+            "s3://${{ vars.LAMBDA_ARTIFACT_BUCKET }}/${{ vars.LAMBDA_ARTIFACT_PREFIX }}/${GITHUB_SHA}/cpf-login-lambda.jar"
+      - name: Create or update AWS Lambda
+        env:
+          ARTIFACT_KEY: ${{ vars.LAMBDA_ARTIFACT_PREFIX }}/${{ github.sha }}/cpf-login-lambda.jar
+          EXECUTION_ROLE_ARN: ${{ vars.LAMBDA_EXECUTION_ROLE_ARN }}
+          INTERNAL_API_BASE_URL: ${{ vars.INTERNAL_API_BASE_URL }}
+          INTERNAL_API_SECRET: ${{ secrets.INTERNAL_API_SECRET }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+        run: |
+          jq -n \
+            --arg internalApiBaseUrl "$INTERNAL_API_BASE_URL" \
+            --arg internalApiSecret "$INTERNAL_API_SECRET" \
+            --arg jwtSecret "$JWT_SECRET" \
+            '{Variables: {INTERNAL_API_BASE_URL: $internalApiBaseUrl, INTERNAL_API_SECRET: $internalApiSecret, JWT_SECRET: $jwtSecret, JWT_ISSUER: "mechanic-shop-api"}}' \
+            > environment.json
+
+          if aws lambda get-function --function-name "${{ vars.LAMBDA_FUNCTION_NAME }}" >/dev/null 2>&1; then
+            aws lambda update-function-code \
+              --function-name "${{ vars.LAMBDA_FUNCTION_NAME }}" \
+              --zip-file fileb://cpf-login-lambda.jar
+            aws lambda wait function-updated-v2 --function-name "${{ vars.LAMBDA_FUNCTION_NAME }}"
+            aws lambda update-function-configuration \
+              --function-name "${{ vars.LAMBDA_FUNCTION_NAME }}" \
+              --environment file://environment.json
           else
-            echo "name=${{ vars.LAMBDA_FUNCTION_NAME_PROD }}" >> "$GITHUB_OUTPUT"
+            aws lambda create-function \
+              --function-name "${{ vars.LAMBDA_FUNCTION_NAME }}" \
+              --runtime java21 \
+              --handler "org.project.mechanic_shop.cpflogin.CpfLoginRequestHandler::handleRequest" \
+              --role "$EXECUTION_ROLE_ARN" \
+              --timeout 10 \
+              --memory-size 512 \
+              --code "S3Bucket=${{ vars.LAMBDA_ARTIFACT_BUCKET }},S3Key=$ARTIFACT_KEY" \
+              --environment file://environment.json
           fi
-
-      - name: Deploy to AWS Lambda
-        run: |
-          aws lambda update-function-code \
-            --function-name "${{ steps.fn.outputs.name }}" \
-            --zip-file fileb://cpf-login-lambda.jar
