@@ -32,4 +32,4 @@ mvn package   # produces target/cpf-login-lambda.jar, a shaded deployment packag
 
 ## Deploy
 
-CI/CD (`.github/workflows/ci-cd.yml`) builds and tests on every push/PR to `main` or `master`. On a push it uploads an immutable deployment package to S3 and updates the already-provisioned Lambda. It uses GitHub OIDC: configure `AWS_ROLE_TO_ASSUME` as a repository secret; configure `AWS_REGION`, `LAMBDA_ARTIFACT_BUCKET`, `LAMBDA_ARTIFACT_PREFIX`, and `LAMBDA_FUNCTION_NAME` as repository variables. The Kubernetes-infrastructure Terraform repository provisions the function and API Gateway.
+CI/CD (`.github/workflows/ci-cd.yml`) tests every pull request and push to `master`. On a push or manual run it authenticates through GitHub OIDC, builds the shaded JAR, and updates code on the already-provisioned Lambda. Configure `AWS_ROLE_TO_ASSUME` as a repository secret and `AWS_REGION` and `LAMBDA_FUNCTION_NAME` as repository variables. The Kubernetes-infrastructure Terraform repository owns the Lambda configuration, IAM, networking, invocation permissions, and gateway integration; this repository does not create AWS resources or an API Gateway.

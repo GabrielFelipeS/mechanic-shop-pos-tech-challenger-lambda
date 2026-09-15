@@ -12,151 +12,35 @@ permissions:
   id-token: write
 
 jobs:
-  build-test:
+  test-and-deploy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Setup Java 21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 21
           cache: maven
+
       - name: Run tests
         run: mvn test
-      - name: Package deployment artifact
-        run: mvn package -DskipTests
-      - name: Upload deployment artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: cpf-login-lambda
-          path: target/cpf-login-lambda.jar
 
-  deploy:
-    needs: build-test
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download deployment artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: cpf-login-lambda
       - name: Configure AWS credentials
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
-      - name: Upload immutable Lambda deployment artifact
+
+      - name: Package Lambda code
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: mvn package -DskipTests
+
+      - name: Update Terraform-managed Lambda code
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         run: |
-          aws s3 cp cpf-login-lambda.jar \
-            "s3://${{ vars.LAMBDA_ARTIFACT_BUCKET }}/${{ vars.LAMBDA_ARTIFACT_PREFIX }}/${GITHUB_SHA}/cpf-login-lambda.jar"
-      - name: Create or update AWS Lambda
-        env:
-          ARTIFACT_KEY: ${{ vars.LAMBDA_ARTIFACT_PREFIX }}/${{ github.sha }}/cpf-login-lambda.jar
-          EXECUTION_ROLE_ARN: ${{ vars.LAMBDA_EXECUTION_ROLE_ARN }}
-          INTERNAL_API_BASE_URL: ${{ vars.INTERNAL_API_BASE_URL }}
-          INTERNAL_API_SECRET: ${{ secrets.INTERNAL_API_SECRET }}
-          JWT_SECRET: ${{ secrets.JWT_SECRET }}
-        run: |
-          jq -n \
-            --arg internalApiBaseUrl "$INTERNAL_API_BASE_URL" \
-            --arg internalApiSecret "$INTERNAL_API_SECRET" \
-            --arg jwtSecret "$JWT_SECRET" \
-            '{Variables: {INTERNAL_API_BASE_URL: $internalApiBaseUrl, INTERNAL_API_SECRET: $internalApiSecret, JWT_SECRET: $jwtSecret, JWT_ISSUER: "mechanic-shop-api"}}' \
-            > environment.json
-
-          if aws lambda get-function --function-name "${{ vars.LAMBDA_FUNCTION_NAME }}" >/dev/null 2>&1; then
-            aws lambda update-function-code \
-              --function-name "${{ vars.LAMBDA_FUNCTION_NAME }}" \
-              --zip-file fileb://cpf-login-lambda.jar
-            aws lambda wait function-updated-v2 --function-name "${{ vars.LAMBDA_FUNCTION_NAME }}"
-            aws lambda update-function-configuration \
-              --function-name "${{ vars.LAMBDA_FUNCTION_NAME }}" \
-              --environment file://environment.json
-          else
-            aws lambda create-function \
-              --function-name "${{ vars.LAMBDA_FUNCTION_NAME }}" \
-              --runtime java21 \
-              --handler "org.project.mechanic_shop.cpflogin.CpfLoginRequestHandler::handleRequest" \
-              --role "$EXECUTION_ROLE_ARN" \
-              --timeout 10 \
-              --memory-size 512 \
-              --code "S3Bucket=${{ vars.LAMBDA_ARTIFACT_BUCKET }},S3Key=$ARTIFACT_KEY" \
-              --environment file://environment.json
-          fi
-
-      - name: Create or update CPF-login HTTP API
-        id: api_gateway
-        env:
-          AWS_REGION: ${{ vars.AWS_REGION }}
-          FUNCTION_NAME: ${{ vars.LAMBDA_FUNCTION_NAME }}
-          API_NAME: mechanic-shop-cpf-login
-          ROUTE_KEY: POST /cpf-login
-        run: |
-          aws lambda wait function-active-v2 --function-name "$FUNCTION_NAME"
-
-          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-          FUNCTION_ARN="$(aws lambda get-function --function-name "$FUNCTION_NAME" --query 'Configuration.FunctionArn' --output text)"
-          API_ID="$(aws apigatewayv2 get-apis --query "Items[?Name=='$API_NAME'].ApiId | [0]" --output text)"
-
-          if [ "$API_ID" = "None" ] || [ -z "$API_ID" ]; then
-            API_ID="$(aws apigatewayv2 create-api \
-              --name "$API_NAME" \
-              --protocol-type HTTP \
-              --query ApiId \
-              --output text)"
-          fi
-
-          INTEGRATION_URI="arn:aws:apigateway:${AWS_REGION}:lambda:path/2015-03-31/functions/${FUNCTION_ARN}/invocations"
-          INTEGRATION_ID="$(aws apigatewayv2 get-integrations \
-            --api-id "$API_ID" \
-            --query "Items[?IntegrationUri=='$INTEGRATION_URI'].IntegrationId | [0]" \
-            --output text)"
-
-          if [ "$INTEGRATION_ID" = "None" ] || [ -z "$INTEGRATION_ID" ]; then
-            INTEGRATION_ID="$(aws apigatewayv2 create-integration \
-              --api-id "$API_ID" \
-              --integration-type AWS_PROXY \
-              --integration-uri "$INTEGRATION_URI" \
-              --payload-format-version 2.0 \
-              --query IntegrationId \
-              --output text)"
-          fi
-
-          ROUTE_ID="$(aws apigatewayv2 get-routes \
-            --api-id "$API_ID" \
-            --query "Items[?RouteKey=='$ROUTE_KEY'].RouteId | [0]" \
-            --output text)"
-          if [ "$ROUTE_ID" = "None" ] || [ -z "$ROUTE_ID" ]; then
-            aws apigatewayv2 create-route \
-              --api-id "$API_ID" \
-              --route-key "$ROUTE_KEY" \
-              --target "integrations/$INTEGRATION_ID" >/dev/null
-          else
-            aws apigatewayv2 update-route \
-              --api-id "$API_ID" \
-              --route-id "$ROUTE_ID" \
-              --target "integrations/$INTEGRATION_ID" >/dev/null
-          fi
-
-          if ! aws apigatewayv2 get-stage --api-id "$API_ID" --stage-name '$default' >/dev/null 2>&1; then
-            aws apigatewayv2 create-stage \
-              --api-id "$API_ID" \
-              --stage-name '$default' \
-              --auto-deploy >/dev/null
-          fi
-
-          STATEMENT_ID="allow-api-gateway-cpf-login"
-          aws lambda remove-permission \
-            --function-name "$FUNCTION_NAME" \
-            --statement-id "$STATEMENT_ID" >/dev/null 2>&1 || true
-          aws lambda add-permission \
-            --function-name "$FUNCTION_NAME" \
-            --statement-id "$STATEMENT_ID" \
-            --action lambda:InvokeFunction \
-            --principal apigateway.amazonaws.com \
-            --source-arn "arn:aws:execute-api:${AWS_REGION}:${ACCOUNT_ID}:${API_ID}/*/POST/cpf-login" >/dev/null
-
-          API_URL="https://${API_ID}.execute-api.${AWS_REGION}.amazonaws.com/cpf-login"
-          echo "url=$API_URL" >> "$GITHUB_OUTPUT"
-          echo "CPF_LOGIN_URL=$API_URL" >> "$GITHUB_STEP_SUMMARY"
+          aws lambda update-function-code \
+            --function-name "${{ vars.LAMBDA_FUNCTION_NAME }}" \
+            --zip-file fileb://target/cpf-login-lambda.jar
