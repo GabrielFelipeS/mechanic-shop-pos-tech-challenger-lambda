@@ -1,35 +1,66 @@
-# cpf-login-lambda
+# Lambda de login por CPF
 
-AWS Lambda function that logs a customer in by CPF, for the `mechanic-shop-pos-tech-challenger` project. Validates the CPF, checks the customer's existence/status against the main app's internal endpoint, and issues a JWT compatible with the app's existing `TokenService` (same secret/issuer/HS256/subject=email).
+Função serverless do Tech Challenge - Fase 3 responsável por autenticar clientes pelo CPF. Ela valida o documento, consulta a API principal para confirmar que há um cliente ativo e devolve um JWT aceito pelas rotas protegidas da aplicação.
 
-## Handler
+## Como funciona
 
-`org.project.mechanic_shop.cpflogin.CpfLoginRequestHandler::handleRequest`
-
-Expects an API Gateway (or Kong `aws-lambda` plugin, with `awsgateway_compatible = true`) proxy-integration event: `POST` with a JSON body `{"document": "<cpf>"}`.
-
-| Response | Meaning |
-|---|---|
-| `200 {"token": "..."}` | CPF valid, customer exists, active |
-| `400` | Missing/malformed body, or invalid CPF checksum |
-| `404` | CPF valid but no active `CUSTOMER` found for it |
-| `405` | Method other than `POST` |
-| `502` | Could not reach the internal customer-status endpoint |
-
-## Required environment variables
-
-- `JWT_SECRET` — must match `api.security.token.secret` on the main app and the `jwt_secrets[].secret` configured in Kong.
-- `JWT_ISSUER` — defaults to `mechanic-shop-api` if unset; must match the main app's issuer.
-- `INTERNAL_API_BASE_URL` — base URL of the main app (e.g. its internal load balancer/service DNS), reachable from wherever this Lambda runs (needs network access into the app's VPC/cluster).
-- `INTERNAL_API_SECRET` — must match `internal.api.secret` on the main app.
-
-## Build
-
-```bash
-mvn test      # unit tests (Mockito-based, no AWS/network needed)
-mvn package   # produces target/cpf-login-lambda.jar, a shaded deployment package
+```mermaid
+sequenceDiagram
+  participant C as Cliente
+  participant K as Kong/API Gateway
+  participant L as Lambda CPF Login
+  participant A as API principal
+  C->>K: POST /functions/cpf-login {document}
+  K->>L: Evento proxy AWS
+  L->>L: Valida checksum do CPF
+  L->>A: GET /internal/customers/{cpf}/status
+  A-->>L: Cliente ativo e e-mail
+  L-->>K: JWT HS256
+  K-->>C: 200 {token}
 ```
 
-## Deploy
+O handler é `org.project.mechanic_shop.cpflogin.CpfLoginRequestHandler::handleRequest`. Ele aceita um evento de integração proxy do API Gateway ou do plugin `aws-lambda` do Kong, somente pelo método `POST`, com corpo JSON `{"document":"<cpf>"}`.
 
-CI/CD (`.github/workflows/ci-cd.yml`) tests every pull request and push to `master`. On a push or manual run it authenticates through GitHub OIDC, builds the shaded JAR, and updates code on the already-provisioned Lambda. Configure `AWS_ROLE_TO_ASSUME` as a repository secret and `AWS_REGION` and `LAMBDA_FUNCTION_NAME` as repository variables. The Kubernetes-infrastructure Terraform repository owns the Lambda configuration, IAM, networking, invocation permissions, and gateway integration; this repository does not create AWS resources or an API Gateway.
+| Código | Significado |
+|---|---|
+| `200` | CPF válido, cliente existe e está ativo; retorna `token` |
+| `400` | Corpo ausente/malformado ou CPF inválido |
+| `404` | Não existe cliente ativo com o CPF informado |
+| `405` | Método diferente de `POST` |
+| `502` | Não foi possível consultar a API principal |
+
+## Tecnologias
+
+Java 21, AWS Lambda Java Core/Events, Java JWT (Auth0), Maven, JUnit 5 e Mockito.
+
+## Pré-requisitos e configuração
+
+Para build local, use JDK 21 e Maven 3.9+.
+
+No ambiente AWS, configure estas variáveis na Lambda:
+
+- `JWT_SECRET`: mesmo segredo da API e do Kong;
+- `JWT_ISSUER`: emissor do token; o padrão é `mechanic-shop-api`;
+- `INTERNAL_API_BASE_URL`: URL interna alcançável da API principal;
+- `INTERNAL_API_SECRET`: mesmo valor de `internal.api.secret` da API.
+
+Nunca versionar os valores reais dessas variáveis.
+
+## Executar, testar e empacotar
+
+```bash
+git clone <URL_DO_REPOSITORIO>
+cd mechanic-shop-pos-tech-challenger-lambda
+mvn test
+mvn package
+```
+
+O pacote de deploy é `target/cpf-login-lambda.jar`. Para uma execução de desenvolvimento, há o `LocalRunner` em testes; ele não substitui a integração real com AWS/Kong.
+
+## Implantação e API
+
+A infraestrutura da função - IAM, rede, permissões de invocação e integração com Kong - é criada pelo repositório `mechanic-shop-pos-tech-challenger-kubernetes`, no diretório `lambda/`. Depois de criada, publique o JAR com `aws lambda update-function-code` ou por uma pipeline autenticada via OIDC.
+
+Esta função não expõe Swagger próprio: seu contrato é o evento Lambda descrito acima. A documentação das APIs consumidas pelo usuário está no [Swagger da aplicação principal](http://localhost:8080/swagger-ui.html), quando o ambiente local estiver em execução.
+
+Este checkout não contém workflow de CI/CD versionado. Para aderir ao enunciado, a pipeline deve testar e empacotar em pull requests e atualizar o código da Lambda somente nas branches autorizadas.
